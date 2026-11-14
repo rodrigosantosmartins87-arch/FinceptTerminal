@@ -1,4 +1,4 @@
-name: Preservar historico Git completo
+name: Preservar historico Git e auditar LFS
 on:
   push:
     branches: [preservacao-independente-2026-11]
@@ -6,43 +6,96 @@ on:
   workflow_dispatch:
 permissions:
   contents: write
+concurrency:
+  group: preservar-fincept
+  cancel-in-progress: false
 jobs:
   backup:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
-      - name: Clonar historico completo do fork
-        run: git clone --mirror "https://github.com/${GITHUB_REPOSITORY}.git" mirror.git
-      - name: Validar integridade, criar e restaurar bundle
+      - name: Clonar e verificar historico Git
         shell: bash
         run: |
           set -Eeuo pipefail
-          git -C mirror.git fsck --full --no-reflogs
+          git clone --mirror "https://github.com/${GITHUB_REPOSITORY}.git" mirror.git
+          git -C mirror.git cat-file -e 68691b7577ce642009cdf2c1b4b0766ca9e37999^{commit}
+          git -C mirror.git fsck --full --no-reflogs 2>&1 | tee fsck-mirror.log
           git -C mirror.git bundle create "$PWD/FinceptTerminal-completo.bundle" --all
-          git -C mirror.git bundle verify "$PWD/FinceptTerminal-completo.bundle"
+          git -C mirror.git bundle verify "$PWD/FinceptTerminal-completo.bundle" 2>&1 | tee bundle-verify.log
           git clone --mirror "$PWD/FinceptTerminal-completo.bundle" restaurado.git
-          git -C restaurado.git fsck --full --no-reflogs
+          git -C restaurado.git fsck --full --no-reflogs 2>&1 | tee fsck-restaurado.log
           git -C mirror.git show-ref | LC_ALL=C sort > refs-mirror.txt
           git -C restaurado.git show-ref | LC_ALL=C sort > refs-restaurado.txt
           diff -u refs-mirror.txt refs-restaurado.txt
-          sha256sum FinceptTerminal-completo.bundle > SHA256SUMS
+          test "$(git -C mirror.git symbolic-ref HEAD)" = "$(git -C restaurado.git symbolic-ref HEAD)"
           git -C mirror.git rev-parse refs/heads/main > MAIN-SHA.txt
-      - name: Salvar bundle como artefato de recuperacao
-        uses: actions/upload-artifact@v4
+      - name: Recuperar e auditar objetos LFS historicos
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git -C mirror.git lfs ls-files --all --json > lfs-inventory.json
+          if git -C mirror.git lfs fetch --all > lfs-fetch.log 2>&1; then
+            echo "fork LFS fetch succeeded" > lfs-fetch-status.txt
+          else
+            echo "fork LFS fetch failed; trying upstream" > lfs-fetch-status.txt
+            git -C mirror.git remote add upstream https://github.com/Fincept-Corporation/FinceptTerminal.git
+            if git -C mirror.git lfs fetch --all upstream >> lfs-fetch.log 2>&1; then
+              echo "upstream LFS fetch succeeded" >> lfs-fetch-status.txt
+            else
+              echo "upstream LFS fetch failed; backup may be incomplete" >> lfs-fetch-status.txt
+            fi
+          fi
+          python3 - <<'PY'
+          import json, pathlib, hashlib
+          data=json.load(open("lfs-inventory.json"))
+          objects={f["oid"]: f for f in data["files"]}
+          missing=[]; valid=[]; corrupt=[]
+          for oid,f in objects.items():
+              p=pathlib.Path("mirror.git/lfs/objects")/oid[:2]/oid[2:4]/oid
+              if not p.exists():
+                  missing.append({"oid":oid,"size":f["size"],"name":f["name"]})
+              elif hashlib.sha256(p.read_bytes()).hexdigest()!=oid:
+                  corrupt.append(oid)
+              else:
+                  valid.append(oid)
+          result={"unique":len(objects),"valid":valid,"missing":missing,"corrupt":corrupt}
+          pathlib.Path("lfs-status.json").write_text(json.dumps(result,indent=2))
+          pathlib.Path("BACKUP-STATUS.txt").write_text("GIT_OK_LFS_INCOMPLETE\n" if missing or corrupt else "GIT_AND_LFS_OK\n")
+          PY
+          if [ -d mirror.git/lfs/objects ]; then tar -czf FinceptTerminal-lfs.tar.gz -C mirror.git/lfs objects; fi
+          sha256sum FinceptTerminal-completo.bundle > SHA256SUMS
+          if [ -f FinceptTerminal-lfs.tar.gz ]; then sha256sum FinceptTerminal-lfs.tar.gz >> SHA256SUMS; fi
+          sha256sum -c SHA256SUMS
+      - name: Salvar evidencias e backup
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: FinceptTerminal-backup-git
           path: |
             FinceptTerminal-completo.bundle
+            FinceptTerminal-lfs.tar.gz
             SHA256SUMS
             MAIN-SHA.txt
-            refs-mirror.txt
+            refs-*.txt
+            *.log
+            lfs-*.json
+            lfs-fetch-status.txt
+            BACKUP-STATUS.txt
           retention-days: 90
           compression-level: 0
-      - name: Publicar backup persistente como release no fork
+          if-no-files-found: error
+      - name: Publicar backup com limitacoes explicitas
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -Eeuo pipefail
-          TAG="fincept-preservacao-${GITHUB_RUN_ID}"
-          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "${GITHUB_SHA}" --title "Backup Git verificavel - ${GITHUB_RUN_ID}" --notes "Espelho Git + bundle, checksum SHA-256 e teste de restauracao. A release depende da conta GitHub e NAO substitui copia em outro provedor." FinceptTerminal-completo.bundle SHA256SUMS MAIN-SHA.txt refs-mirror.txt
+          TAG="fincept-preservacao-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          printf 'Historico Git restaurado e refs comparadas. Estado: %s. Bundle nao contem objetos LFS. Consulte lfs-status.json. Nao substitui copia fora do GitHub. Wiki, issues, anexos e releases externas nao fazem parte do bundle.\n' "$(cat BACKUP-STATUS.txt)" > release-notes.txt
+          files=(FinceptTerminal-completo.bundle SHA256SUMS MAIN-SHA.txt refs-mirror.txt refs-restaurado.txt lfs-status.json BACKUP-STATUS.txt)
+          if [ -f FinceptTerminal-lfs.tar.gz ]; then files+=(FinceptTerminal-lfs.tar.gz); fi
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "${GITHUB_SHA}" --title "Preservacao Git auditada - ${GITHUB_RUN_ID}" --notes-file release-notes.txt "${files[@]}"
+      - name: Impedir sucesso quando LFS estiver incompleto
+        shell: bash
+        run: |
+          test "$(cat BACKUP-STATUS.txt)" = GIT_AND_LFS_OK
