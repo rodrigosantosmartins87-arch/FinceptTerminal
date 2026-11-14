@@ -1,0 +1,48 @@
+name: Preservar historico Git completo
+on:
+  push:
+    branches: [preservacao-independente-2026-11]
+    paths: [.github/workflows/preservar-fincept.yml]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Clonar historico completo do fork
+        run: git clone --mirror "https://github.com/${GITHUB_REPOSITORY}.git" mirror.git
+      - name: Validar integridade, criar e restaurar bundle
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git -C mirror.git fsck --full --no-reflogs
+          git -C mirror.git bundle create "$PWD/FinceptTerminal-completo.bundle" --all
+          git -C mirror.git bundle verify "$PWD/FinceptTerminal-completo.bundle"
+          git clone --mirror "$PWD/FinceptTerminal-completo.bundle" restaurado.git
+          git -C restaurado.git fsck --full --no-reflogs
+          git -C mirror.git show-ref | LC_ALL=C sort > refs-mirror.txt
+          git -C restaurado.git show-ref | LC_ALL=C sort > refs-restaurado.txt
+          diff -u refs-mirror.txt refs-restaurado.txt
+          sha256sum FinceptTerminal-completo.bundle > SHA256SUMS
+          git -C mirror.git rev-parse refs/heads/main > MAIN-SHA.txt
+      - name: Salvar bundle como artefato de recuperacao
+        uses: actions/upload-artifact@v4
+        with:
+          name: FinceptTerminal-backup-git
+          path: |
+            FinceptTerminal-completo.bundle
+            SHA256SUMS
+            MAIN-SHA.txt
+            refs-mirror.txt
+          retention-days: 90
+          compression-level: 0
+      - name: Publicar backup persistente como release no fork
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          TAG="fincept-preservacao-${GITHUB_RUN_ID}"
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "${GITHUB_SHA}" --title "Backup Git verificavel - ${GITHUB_RUN_ID}" --notes "Espelho Git + bundle, checksum SHA-256 e teste de restauracao. A release depende da conta GitHub e NAO substitui copia em outro provedor." FinceptTerminal-completo.bundle SHA256SUMS MAIN-SHA.txt refs-mirror.txt
